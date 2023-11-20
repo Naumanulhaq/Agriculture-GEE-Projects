@@ -1,0 +1,316 @@
+var provinceBoundary = ee.FeatureCollection("projects/ee-nulhaq/assets/ProvinceBoundary_updated2018"),
+    table = ee.FeatureCollection("projects/ee-nulhaq/assets/Kharif2023GT"),
+    districtBoundary = ee.FeatureCollection("projects/ee-nulhaq/assets/DistrictBoundary_updated2022_V2"),
+    table2 = ee.FeatureCollection("projects/ee-nulhaq/assets/sindh_clean_rice_points"),
+    table3 = ee.FeatureCollection("projects/ee-nulhaq/assets/KP_Clean_Rice");
+
+var s2Clouds = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY');
+
+// Define the area of interest using shapefile from assets
+var areaOfInterest = 'Sindh';
+var roi = provinceBoundary.filter(ee.Filter.eq('PROVINCE', areaOfInterest)).geometry();
+Map.centerObject(roi,8);
+Map.addLayer(roi,{},'roi')
+
+// Define the start and end dates and the time interval
+var startDate = ee.Date('2023-05-01');
+var endDate = ee.Date('2023-09-30');
+var interval = 29;
+var MAX_CLOUD_PROBABILITY = 65;
+
+function maskClouds(img) {
+  var clouds = ee.Image(img.get('cloud_mask')).select('probability');
+  var isNotCloud = clouds.lt(MAX_CLOUD_PROBABILITY);
+  return img.updateMask(isNotCloud);
+}
+
+// Load the Sentinel-2 image collection
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR')
+    .filterDate(startDate, endDate)
+    .filterBounds(roi)
+    .select(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B11', 'B12']);
+    //.select([/*'B3',*/ 'B4', 'B8']);
+    
+s2Clouds = s2Clouds.filterDate(startDate, endDate)
+    .filterBounds(roi)
+
+// Join S2 SR with cloud probability dataset to add cloud mask.
+var s2SrWithCloudMask = ee.Join.saveFirst('cloud_mask').apply({
+  primary: s2,
+  secondary: s2Clouds,
+  condition:
+      ee.Filter.equals({leftField: 'system:index', rightField: 'system:index'})
+});
+
+var s2CloudMasked =
+    ee.ImageCollection(s2SrWithCloudMask).map(maskClouds);
+// Map.addLayer(s2CloudMasked, {}, "cloudCheck")
+
+// Define a function to calculate NDVI
+function addNDVI(image) {
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  //var ndwi = image.normalizedDifference(['B3', 'B8']).rename('NDWI');
+  //var gndvi = image.normalizedDifference(['B8', 'B3']).rename('GNDVI');
+  return image.addBands(ndvi)/*.addBands(ndwi).addBands(gndvi)*/.clip(roi);
+}
+
+// Map the function over the image collection
+var s2NDVI = s2/*CloudMasked*/.map(addNDVI);
+// print(s2NDVI, 's2NDVI') // Total number of images in the collection
+
+// Define an empty image to use as a canvas for compositing
+var empty = ee.Image().byte();
+
+// Define a list of dates to composite
+var dates = ee.List.sequence(
+  ee.Date(startDate).millis(),
+  ee.Date(endDate).millis(),
+  interval * 24 * 60 * 60 * 1000
+);
+// print(dates, 'dates')
+
+// Define a function to create the composites
+function createComposite(date, list) {
+  var start = ee.Date(date);
+  var end = start.advance(interval, 'day');
+  var collection = ee.ImageCollection(list)
+    .filterDate(start, end)
+    //.select(['NDVI']);
+    //.select(['NDVI', 'NDWI', 'GNDVI']);
+  var composite = collection.max().set('system:time_start', start.millis());
+  return ee.Image(empty).blend(composite);
+}
+
+// Map the function over the list of dates to create the composites
+var composites_inspect = ee.ImageCollection.fromImages(
+  dates.map(function(date) {
+    return createComposite(date, s2NDVI);
+  })
+);
+// print(composites_inspect, 'composites_inspect');
+Map.addLayer(composites_inspect,{},'composites_inspect',false);
+
+// Map the function over the list of dates to create the composites
+var image = ee.ImageCollection.fromImages(
+  dates.map(function(date) {
+    return createComposite(date, s2NDVI);
+  })
+).toBands();
+
+Map.addLayer(image.clip(roi),{min:0,max:6000},"sentinel", false)
+// print(image, 'Composite (number of images in the form of bands)');
+
+// ----------------------------------------------------------------------------------- Data Preparation and Classification
+
+// add a random column
+var query_rice = table2.filterBounds(roi).filter(ee.Filter.eq('code',1));
+var query_other = table.filterBounds(roi).filter(ee.Filter.neq('code',1));
+
+var rice_oned = query_rice.map(function(feature) {
+  return feature.set('rice', 1).set('class', 1);
+});
+var other_zeroed = query_other.map(function(feature) {
+  return feature.set('other', 0).set('class', 0);
+});
+
+var rice = rice_oned.randomColumn("random");
+var other = other_zeroed.randomColumn("random");
+ 
+// create a training sample
+var riceTrain = rice.filter(ee.Filter.lt("random",0.7));
+var otherTrain = other.filter(ee.Filter.lt("random",0.7));
+ 
+// create a validation sample
+var riceVal = rice.filter(ee.Filter.gt("random",0.7));
+var otherVal = other.filter(ee.Filter.gt("random",0.7));
+ 
+// combine training data
+var TrainingSample = riceTrain.merge(otherTrain);
+Map.addLayer(TrainingSample, {color: 'blue'}, 'Training Points', false);
+
+// combine validation data
+var validationSample = riceVal.merge(otherVal)
+Map.addLayer(validationSample, {color: 'red'}, 'Validation Points', false);
+
+// sample the image
+var trainingSample = image.sampleRegions({collection:TrainingSample,properties:["class"],scale:10});
+
+// create a list with bandNames
+var bandNames = image.bandNames();
+
+// train the random forest classifier
+var classifier = ee.Classifier.smileRandomForest(30).train({features:trainingSample,classProperty:"class",inputProperties:bandNames});
+  
+// apply the classifier to the image
+var classification = image.classify(classifier,'Mode');
+
+// add the image to the map
+Map.addLayer(classification.clip(roi),{min:0,max:1,palette:"white,green"},"rice");
+
+// ----------------------------------------------------------------------------------- Classifier Relative Importance
+// get info from classifier
+var dict = classifier.explain();
+
+// get the variable importance from dict
+var variable_importance = ee.Feature(null, ee.Dictionary(dict).get('importance'));
+
+// plot the variable importance
+var chart =
+ui.Chart.feature.byProperty(variable_importance)
+  .setChartType('ColumnChart')
+  .setOptions({
+  title: 'Random Forest Variable Importance',
+  legend: {position: 'none'},
+  hAxis: {title: 'Bands'},
+  vAxis: {title: 'Importance'}
+});
+ 
+print(chart);
+
+// ----------------------------------------------------------------------------------- Classifier Test
+// get the confustion matrix
+var classifier_confMatrix = classifier.confusionMatrix();
+  
+var classifier_OA = classifier_confMatrix.accuracy();
+var classifier_CA = classifier_confMatrix.consumersAccuracy();
+var classifier_Kappa = classifier_confMatrix.kappa();
+var classifier_Order = classifier_confMatrix.order();
+var classifier_PA = classifier_confMatrix.producersAccuracy();
+  
+// print(classifier_confMatrix,'classifier_Confusion Matrix');
+// print(classifier_OA,'classifier_Overall Accuracy');
+// print(classifier_CA,'classifier_Consumers Accuracy');
+// print(classifier_Kappa,'classifier_Kappa');
+// print(classifier_Order,'classifier_Order');
+// print(classifier_PA,'classifier_Producers Accuracy');
+
+// Create a Feature for each metric
+var classifier_OAF = ee.Feature(null, {'metric': 'Overall Accuracy', 'value': classifier_OA});
+var classifier_CAF = ee.Feature(null, {'metric': 'Consumers Accuracy', 'value': classifier_CA});
+var classifier_KappaF = ee.Feature(null, {'metric': 'Kappa', 'value': classifier_Kappa});
+var classifier_OrderF = ee.Feature(null, {'metric': 'Order', 'value': classifier_Order});
+var classifier_PAF = ee.Feature(null, {'metric': 'Producers Accuracy', 'value': classifier_PA});
+
+// Combine the metric features and matrix features
+var classifier_metricsCollection = ee.FeatureCollection([classifier_OAF, classifier_CAF, classifier_KappaF, classifier_OrderF, classifier_PAF]);
+
+// Export the combined metrics and confusion matrix to a CSV
+Export.table.toDrive({
+  collection: classifier_metricsCollection,
+  description: 'Sindh_classifier_metricsCollection',
+  folder: 'earthengine',
+  fileFormat: 'CSV'
+});
+
+// ----------------------------------------------------------------------------------- Results Validation
+// sample the result using the validation sample
+var validation = classification.sampleRegions(validationSample,["class"],10);
+
+var confMatrix = validation.errorMatrix("class","Mode");
+
+var OA = confMatrix.accuracy();
+var CA = confMatrix.consumersAccuracy();
+var Kappa = confMatrix.kappa();
+var Order = confMatrix.order();
+var PA = confMatrix.producersAccuracy();
+
+// Create a Feature for each metric
+var OAF = ee.Feature(null, {'metric': 'Overall Accuracy', 'value': OA});
+var CAF = ee.Feature(null, {'metric': 'Consumers Accuracy', 'value': CA});
+var KappaF = ee.Feature(null, {'metric': 'Kappa', 'value': Kappa});
+var OrderF = ee.Feature(null, {'metric': 'Order', 'value': Order});
+var PAF = ee.Feature(null, {'metric': 'Producers Accuracy', 'value': PA});
+
+// Combine the metric features and matrix features
+var metricsCollection = ee.FeatureCollection([OAF, CAF, KappaF, OrderF, PAF])//.merge(matrixFeatures);
+
+// Export the combined metrics and confusion matrix to a CSV
+Export.table.toDrive({
+  collection: metricsCollection,
+  description: 'KP_metricsCollection',
+  folder: 'earthengine',
+  fileFormat: 'CSV'
+});
+
+// Convert the confusion matrix into a list of lists
+var matrixList = confMatrix.array().toList();
+
+// Determine the number of columns in the confusion matrix
+var numColumns = ee.List(matrixList.get(0)).size();
+
+// Create a list of column names
+var columnNames = ee.List.sequence(0, numColumns.subtract(1)).map(function(idx) {
+  return ee.String('column_').cat(ee.Number(idx).toInt().format());
+});
+
+// Create a Feature for each row in the matrix
+var matrixFeatures = matrixList.map(function(row) {
+  row = ee.List(row);
+  var dict = ee.Dictionary.fromLists(columnNames, row);
+  return ee.Feature(null, dict);
+});
+
+// Create a FeatureCollection from the matrix features
+var matrixCollection = ee.FeatureCollection(matrixFeatures);
+
+// Export the confusion matrix to a CSV
+Export.table.toDrive({
+  collection: matrixCollection,
+  folder: 'earthengine',
+  description: 'KP_confusion_matrix',
+  fileFormat: 'CSV'
+});
+
+// ----------------------------------------------------------------------------------- Compute the district wise area
+// Calculate the rice area in each district
+// Mask for class 1 (rice)
+var riceMask = classification.eq(1);
+
+var computeRicePixelCount = function(feature) {
+  var districtMasked = riceMask.clip(feature);
+
+  var count = districtMasked.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: feature.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
+  // Set the rice pixel count to the feature
+  return feature.set('RicePixelCount', count.get('Mode')).set('DistrictName', feature.get('DISTRICT'));
+};
+
+// Apply the function to each district
+var results = districtBoundary.filter(ee.Filter.eq('PROVINCE', areaOfInterest)).map(computeRicePixelCount);
+
+// ----------------------------------------------------------------------------------- Exports
+
+// // Export Spectral Signatures of Rice for the ROI
+// var sampledRiceData = image.sampleRegions({
+//   collection: query_rice,
+//   properties: ['PROVINCE', 'DISTRICT', 'land', 'code', 'latitude', 'longitude'],  // 'code' is a relevant property to keep
+//   scale: 10 
+// });
+// Export.table.toDrive({
+//   collection: sampledRiceData,
+//   description: 'Sindh_Rice_SpectralSignatures',
+//   folder: 'earthengine',
+//   fileFormat: 'CSV'
+// });
+
+// // Export the district wise results as a CSV format
+// Export.table.toDrive({
+//   collection: results,
+//   description: 'Punjab_Area',
+//   folder: 'earthengine',
+//   fileFormat: 'CSV'
+// });
+
+// // Export the classification map as a GeoTIFF
+// Export.image.toDrive({
+//   image: classification.clip(roi),
+//   description: 'KP_NDVI_without_Clouds',
+//   folder: 'earthengine',
+//   region: roi,
+//   scale: 10,
+//   maxPixels: 1e13
+// });
