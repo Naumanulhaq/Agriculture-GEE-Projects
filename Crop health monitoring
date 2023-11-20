@@ -1,0 +1,93 @@
+var MODIS = ee.ImageCollection("MODIS/061/MOD13Q1"),
+gsw = ee.Image("JRC/GSW1_3/GlobalSurfaceWater"),
+imageCollection = ee.ImageCollection("COPERNICUS/Landcover/100m/Proba-V-C3/Global");
+
+var crop=imageCollection.filterDate('2019-01-01','2019-12-31').max()
+.select('discrete_classification').eq(40).clip(geometry)
+
+Map.centerObject(geometry, 5)
+
+var NDVI=MODIS.select('NDVI');
+
+// Let's compute seasonal NDVI deviation for the AOI
+// Do not include the current period here
+var historical_date_from = 2017;        // Historical date from
+var historical_date_to = 2022;          // Historical date to
+var current_date_from = '2023-08-01';   // Current year starting month and year
+var current_date_to = '2023-08-15';     // Current year ending month and year
+var month_tobe_compared = 8;            // State the month of your analysis on which historical and current data will be compared
+
+var lpaYears = ee.List.sequence(historical_date_from, historical_date_to)
+
+// Prepare the date format
+var dateFormat = 'yyyy-MM-dd';
+
+// Function to generate an image for each year in the historical range for the specific interval
+var monthlyImages = function(year) {
+  year = ee.Number(year).toInt();
+  var startDate = ee.Date.fromYMD(year, month_tobe_compared, 1).format(dateFormat);
+  var endDate = ee.Date.fromYMD(year, month_tobe_compared, 15).format(dateFormat);
+  return NDVI.filter(ee.Filter.date(startDate, endDate)).max().set('year', year);
+};
+
+// Map the function over the list of years to create the image collection
+var monthlyCol = ee.ImageCollection.fromImages(lpaYears.map(monthlyImages));
+print(monthlyCol, 'historical dataset')
+
+// Extract only months histroical data
+var monthlyCol = monthlyCol.map(function(img){
+  return img.multiply(0.0001)
+});
+var SpecificMonth = monthlyCol.toBands();
+
+// Now we take present data and compute monthly average
+var currentNDVI = NDVI.filter(ee.Filter.date(current_date_from, current_date_to)).max();
+print(currentNDVI, 'currentNDVI')
+
+var NDVINormal = monthlyCol.mean()
+var NDVIstress = currentNDVI.multiply(0.0001)
+
+Map.addLayer(NDVINormal,{},'NDVI Previous years', false);
+Map.addLayer(NDVIstress,{},'NDVI Current year', false);
+
+var seasonalDeviation = (NDVINormal.subtract(NDVIstress))
+
+var visParams = {
+  min:-0.3,
+  max:0.5,
+  palette: ['abdda4','ffffbf','fdae61','d7191c']
+}
+
+Map.addLayer(seasonalDeviation.clip(geometry).updateMask(crop), visParams, 'Deviation',false)
+
+//Decision trees
+var DTstring = ['1) root 9999 9999 9999', '2) NDVI >= 0.3 9999 9999 1 *', //Severe stress
+'3) NDVI <0.3 9999 9999 9999', '6) NDVI >= 0.2 9999 9999 2 *', // Moderate stress
+'7) NDVI <0.2 9999 9999 9999', '14) NDVI >= 0.1 9999 9999 3 *', // Mild stress
+'15) NDVI <0.1 9999 9999 4 *'].join("\n"); //No stress
+
+var classifier = ee.Classifier.decisionTree(DTstring);
+var Final_classification = seasonalDeviation.select('NDVI').classify(classifier);
+
+var visParams_1 = {
+  min:1,
+  max:4,
+  palette: ['ff0404','ffa706','ffec08','02ff2d']
+}
+
+//legend
+var add_legend = function(title, lbl, pal) {
+  var legend = ui.Panel({style: {position: 'bottom-right'}}), entry;
+  legend.add(ui.Label({value: title, style: { fontWeight: 'bold', fontSize: '15px', margin: '0 0 9px 0', padding: '0px' } }));
+  for (var x = 0; x < lbl.length; x++){
+    entry = [ ui.Label({style:{color: pal[x], margin: '0 0 15px 0'}, value: '██'}),
+      ui.Label({ value: labels[x], style: { margin: '0 0 15px 9px' } }) ];
+    legend.add(ui.Panel(entry, ui.Panel.Layout.Flow('horizontal')))
+  } Map.add(legend); }
+  
+  var palette = ['ff0404','ffa706','ffec08','02ff2d']
+var labels = ['Severe','Moderate','Mild','No Stress'];  
+add_legend('Crop Stress Classification', labels, palette);
+  Map.addLayer(Final_classification.clip(geometry).updateMask(crop),
+            {palette: palette, min: 1, max: 4},
+            'classification');
