@@ -1,0 +1,102 @@
+var provinceBoundary = ee.FeatureCollection("projects/ee-nulhaq/assets/ProvinceBoundary_updated2018"),
+    districtBoundary = ee.FeatureCollection("projects/ee-nulhaq/assets/DistrictBoundary_updated2022_V2"),
+    table = ee.FeatureCollection("projects/ee-nulhaq/assets/Kharif2023GT");
+
+var s2Clouds = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY');
+
+// Define the area of interest using shapefile from assets
+var areaOfInterest = 'Punjab';
+var roi = provinceBoundary.filter(ee.Filter.eq('PROVINCE', areaOfInterest)).geometry();
+Map.centerObject(roi,8);
+Map.addLayer(roi,{},'roi')
+
+
+// Define the start and end dates and the time interval
+var startDate = ee.Date('2023-01-01');
+var endDate = ee.Date('2023-09-30');
+var interval = 29;
+var MAX_CLOUD_PROBABILITY = 65;
+
+function maskClouds(img) {
+  var clouds = ee.Image(img.get('cloud_mask')).select('probability');
+  var isNotCloud = clouds.lt(MAX_CLOUD_PROBABILITY);
+  return img.updateMask(isNotCloud);
+}
+
+function maskEdges(s2_img) {
+  return s2_img.updateMask(
+      s2_img.select('B8A').mask().updateMask(s2_img.select('B9').mask()));
+}
+
+// Load the Sentinel-2 image collection
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR')
+    .filterDate(startDate, endDate)
+    .filterBounds(roi)
+    .select(['B4', 'B8']);
+    
+s2Clouds = s2Clouds.filterDate(startDate, endDate)
+    .filterBounds(roi)
+
+// Join S2 SR with cloud probability dataset to add cloud mask.
+var s2SrWithCloudMask = ee.Join.saveFirst('cloud_mask').apply({
+  primary: s2,
+  secondary: s2Clouds,
+  condition:
+      ee.Filter.equals({leftField: 'system:index', rightField: 'system:index'})
+});
+
+var s2CloudMasked =
+    ee.ImageCollection(s2SrWithCloudMask).map(maskClouds);
+// Map.addLayer(s2CloudMasked, {}, "cloudCheck")
+
+// Define a function to calculate NDVI
+function addNDVI(image) {
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  return image.addBands(ndvi).clip(roi);
+}
+
+// Map the function over the image collection
+var s2NDVI = s2CloudMasked.map(addNDVI);
+print(s2NDVI, 's2NDVI')
+
+// Define an empty image to use as a canvas for compositing
+var empty = ee.Image().byte();
+
+// Define a list of dates to composite
+var dates = ee.List.sequence(
+  ee.Date(startDate).millis(),
+  ee.Date(endDate).millis(),
+  interval * 24 * 60 * 60 * 1000
+);
+// print(dates, 'dates')
+
+// Define a function to create the composites
+function createComposite(date, list) {
+  var start = ee.Date(date);
+  var end = start.advance(interval, 'day');
+  var collection = ee.ImageCollection(list)
+    .filterDate(start, end)
+    .select('NDVI');
+  var composite = collection.max().set('system:time_start', start.millis());
+  return ee.Image(empty).blend(composite);
+}
+
+// Map the function over the list of dates to create the composites
+var composites_inspect = ee.ImageCollection.fromImages(
+  dates.map(function(date) {
+    return createComposite(date, s2NDVI);
+  })
+);
+// print(composites_inspect, 'composites_inspect');
+Map.addLayer(composites_inspect,{},'composites_inspect',false);
+
+// Map the function over the list of dates to create the composites
+var composites = ee.ImageCollection.fromImages(
+  dates.map(function(date) {
+    return createComposite(date, s2NDVI);
+  })
+).toBands();
+
+print(composites, 'composites');
+Map.addLayer(composites, {},'composites');
+
