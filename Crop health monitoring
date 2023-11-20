@@ -1,6 +1,8 @@
-var MODIS = ee.ImageCollection("MODIS/061/MOD13Q1"),
-gsw = ee.Image("JRC/GSW1_3/GlobalSurfaceWater"),
-imageCollection = ee.ImageCollection("COPERNICUS/Landcover/100m/Proba-V-C3/Global");
+var MODIS = ee.ImageCollection("MODIS/061/MOD13Q1");
+var gsw = ee.Image("JRC/GSW1_3/GlobalSurfaceWater");
+var geometry = ee.FeatureCollection("projects/ee-nulhaq/assets/National_boundary");
+var imageCollection = ee.ImageCollection("COPERNICUS/Landcover/100m/Proba-V-C3/Global");
+
 
 var crop=imageCollection.filterDate('2019-01-01','2019-12-31').max()
 .select('discrete_classification').eq(40).clip(geometry)
